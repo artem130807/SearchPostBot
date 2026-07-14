@@ -22,7 +22,8 @@ const (
 	defaultEmbeddingServiceAddress = "http://localhost:8000/embeddings"
 	defaultQdrantServiceAddress    = "http://localhost:6333"
 	collectionName                 = "chat_history"
-	defaultVectorSearchLimit       = 5
+	defaultVectorSearchLimit       = 3
+	defaultSearchMinScore          = 0.55
 	restrictedAccessMessage        = "Этот бот работает только в разрешённых чатах. Вы можете развернуть свою копию: https://github.com/korjavin/ragtgbot"
 )
 
@@ -33,6 +34,7 @@ var (
 	allowedChannelIDs       []int64
 	vectorSearchLimit       int
 	requireBotMention       bool
+	searchMinScore          float64
 )
 
 type TextList struct {
@@ -129,7 +131,7 @@ func saveToQdrant(pointID int64, chatID int64, messageID int, text string, embed
 	return nil
 }
 
-func searchQdrant(embedding []float32, limit int) ([]map[string]interface{}, error) {
+func searchQdrant(embedding []float32, limit int, minScore float64, channelIDs []int64) ([]map[string]interface{}, error) {
 	qdrantURL := fmt.Sprintf("%s/collections/%s/points/search", qdrantServiceAddress, collectionName)
 
 	embeddingInterface := make([]interface{}, len(embedding))
@@ -142,8 +144,26 @@ func searchQdrant(embedding []float32, limit int) ([]map[string]interface{}, err
 			"name":   "data",
 			"vector": embeddingInterface,
 		},
-		"limit":        limit,
-		"with_payload": true,
+		"limit":          limit,
+		"score_threshold": minScore,
+		"with_payload":   true,
+	}
+
+	if len(channelIDs) > 0 {
+		ids := make([]interface{}, len(channelIDs))
+		for i, id := range channelIDs {
+			ids[i] = id
+		}
+		searchRequest["filter"] = map[string]interface{}{
+			"must": []map[string]interface{}{
+				{
+					"key": "chat_id",
+					"match": map[string]interface{}{
+						"any": ids,
+					},
+				},
+			},
+		}
 	}
 
 	requestBody, err := json.Marshal(searchRequest)
@@ -404,6 +424,39 @@ func payloadInt(payload map[string]interface{}, key string) (int, bool) {
 	return int(value), true
 }
 
+func payloadFloat(payload map[string]interface{}, key string) (float64, bool) {
+	value, ok := payload[key]
+	if !ok {
+		return 0, false
+	}
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	default:
+		return 0, false
+	}
+}
+
+func resultScore(result map[string]interface{}) (float64, bool) {
+	return payloadFloat(result, "score")
+}
+
+func isSearchableUserMessage(msg *tele.Message) bool {
+	if msg == nil {
+		return false
+	}
+	if msg.IsForwarded() || msg.AutomaticForward {
+		return false
+	}
+	return true
+}
+
 func indexChannelPost(c tele.Context) error {
 	chatID := c.Chat().ID
 	if !isAllowedChat(chatID, allowedChannelIDs) {
@@ -436,14 +489,21 @@ func handleSearchQuery(c tele.Context, query string) error {
 		return c.Send("Ошибка обработки запроса.")
 	}
 
-	results, err := searchQdrant(embedding, vectorSearchLimit)
+	results, err := searchQdrant(embedding, vectorSearchLimit, searchMinScore, allowedChannelIDs)
 	if err != nil {
 		log.Printf("Search error: %v", err)
 		return c.Send("Ошибка поиска.")
 	}
 
 	forwarded := 0
+	seen := make(map[string]struct{})
+
 	for _, result := range results {
+		score, ok := resultScore(result)
+		if ok {
+			log.Printf("Search hit score=%.3f", score)
+		}
+
 		payload, ok := result["payload"].(map[string]interface{})
 		if !ok {
 			continue
@@ -457,6 +517,12 @@ func handleSearchQuery(c tele.Context, query string) error {
 		if !ok {
 			continue
 		}
+
+		dedupeKey := fmt.Sprintf("%d:%d", chatID, messageID)
+		if _, exists := seen[dedupeKey]; exists {
+			continue
+		}
+		seen[dedupeKey] = struct{}{}
 
 		src := &tele.Message{
 			ID:   messageID,
@@ -501,6 +567,13 @@ func main() {
 		}
 	}
 
+	searchMinScore = defaultSearchMinScore
+	if scoreStr := os.Getenv("SEARCH_MIN_SCORE"); scoreStr != "" {
+		if score, err := strconv.ParseFloat(scoreStr, 64); err == nil && score > 0 && score <= 1 {
+			searchMinScore = score
+		}
+	}
+
 	allowedQueryChats = parseInt64List(os.Getenv("TG_GROUP_LIST"))
 	allowedChannelIDs = parseInt64List(os.Getenv("TG_CHANNEL_LIST"))
 	requireBotMention = parseBoolEnv(os.Getenv("REQUIRE_BOT_MENTION"), false)
@@ -522,6 +595,7 @@ func main() {
 	} else {
 		log.Println("Indexing enabled for all channels where bot is admin")
 	}
+	log.Printf("Search config: limit=%d min_score=%.2f", vectorSearchLimit, searchMinScore)
 
 	if err := createQdrantCollection(collectionName); err != nil {
 		log.Fatalf("Failed to create/check Qdrant collection: %v", err)
@@ -567,6 +641,10 @@ func main() {
 
 	b.Handle(tele.OnText, func(c tele.Context) error {
 		if c.Sender() != nil && c.Sender().IsBot {
+			return nil
+		}
+
+		if !isSearchableUserMessage(c.Message()) {
 			return nil
 		}
 
