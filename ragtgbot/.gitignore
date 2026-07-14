@@ -1,0 +1,5 @@
+
+/tgbot
+/uploadbackup
+*.pyc
+.env
