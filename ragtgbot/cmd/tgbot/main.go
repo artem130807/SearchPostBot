@@ -32,6 +32,7 @@ var (
 	allowedQueryChats       []int64
 	allowedChannelIDs       []int64
 	vectorSearchLimit       int
+	requireBotMention       bool
 )
 
 type TextList struct {
@@ -333,16 +334,35 @@ func messageText(msg *tele.Message) string {
 	return msg.Caption
 }
 
-func extractQuery(c tele.Context, botUsername string) (string, bool) {
+func parseBoolEnv(value string, defaultValue bool) bool {
+	if value == "" {
+		return defaultValue
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return defaultValue
+	}
+}
+
+func extractQuery(c tele.Context, botUsername string, requireMention bool) (string, bool) {
 	text := strings.TrimSpace(c.Text())
 	if text == "" {
 		return "", false
 	}
 
+	if strings.HasPrefix(text, "/") {
+		return "", false
+	}
+
 	if c.Chat().Type == tele.ChatPrivate {
-		if text == "/start" {
-			return "", false
-		}
+		return text, true
+	}
+
+	if !requireMention {
 		return text, true
 	}
 
@@ -483,11 +503,18 @@ func main() {
 
 	allowedQueryChats = parseInt64List(os.Getenv("TG_GROUP_LIST"))
 	allowedChannelIDs = parseInt64List(os.Getenv("TG_CHANNEL_LIST"))
+	requireBotMention = parseBoolEnv(os.Getenv("REQUIRE_BOT_MENTION"), false)
 
 	if len(allowedQueryChats) > 0 {
 		log.Printf("Queries allowed in %d chat(s)", len(allowedQueryChats))
 	} else {
 		log.Println("Queries allowed in all chats")
+	}
+
+	if requireBotMention {
+		log.Println("Bot mention is required in groups")
+	} else {
+		log.Println("Bot mention is not required: every text message is treated as a query")
 	}
 
 	if len(allowedChannelIDs) > 0 {
@@ -515,10 +542,13 @@ func main() {
 	defer cancel()
 
 	b.Handle("/start", func(c tele.Context) error {
-		return c.Send(
-			"Отправьте текстовый запрос — я найду и перешлю подходящие посты из проиндексированного канала.\n\n" +
-				"В группах упоминайте бота: @" + b.Me.Username + " ваш запрос",
-		)
+		msg := "Отправьте текстовый запрос — я найду и перешлю подходящие посты из проиндексированного канала."
+		if requireBotMention {
+			msg += "\n\nВ группах упоминайте бота: @" + b.Me.Username + " ваш запрос"
+		} else {
+			msg += "\n\nВ группах можно писать запрос без упоминания бота."
+		}
+		return c.Send(msg)
 	})
 
 	b.Handle(tele.OnChannelPost, func(c tele.Context) error {
@@ -536,7 +566,11 @@ func main() {
 	})
 
 	b.Handle(tele.OnText, func(c tele.Context) error {
-		query, isQuery := extractQuery(c, b.Me.Username)
+		if c.Sender() != nil && c.Sender().IsBot {
+			return nil
+		}
+
+		query, isQuery := extractQuery(c, b.Me.Username, requireBotMention)
 		if !isQuery {
 			return nil
 		}

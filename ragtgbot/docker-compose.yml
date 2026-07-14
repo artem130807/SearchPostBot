@@ -32,6 +32,7 @@ services:
       - TG_GROUP_LIST=${TG_GROUP_LIST}
       - TG_CHANNEL_LIST=${TG_CHANNEL_LIST}
       - VECTOR_SEARCH_LIMIT=${VECTOR_SEARCH_LIMIT:-5}
+      - REQUIRE_BOT_MENTION=${REQUIRE_BOT_MENTION:-false}
 
 volumes:
   qdrant_data:
