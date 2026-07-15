@@ -585,6 +585,77 @@ func handleLinkCommand(c tele.Context, botUsername string) error {
 	return c.Send("Ссылка для канала:\n" + link)
 }
 
+func extractPayloadFromText(text, botUsername string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+
+	// Allow raw payload to be sent directly.
+	if strings.HasPrefix(text, "v1.") {
+		return text
+	}
+
+	prefixes := []string{
+		"https://t.me/" + botUsername + "?start=",
+		"http://t.me/" + botUsername + "?start=",
+		"t.me/" + botUsername + "?start=",
+	}
+
+	lowerText := strings.ToLower(text)
+	for _, prefix := range prefixes {
+		lowerPrefix := strings.ToLower(prefix)
+		idx := strings.Index(lowerText, lowerPrefix)
+		if idx < 0 {
+			continue
+		}
+		start := idx + len(prefix)
+		rest := text[start:]
+		if rest == "" {
+			return ""
+		}
+		// Payload ends at first whitespace or URL delimiter.
+		end := len(rest)
+		for i, r := range rest {
+			if r == ' ' || r == '\n' || r == '\t' || r == '&' {
+				end = i
+				break
+			}
+		}
+		return strings.TrimSpace(rest[:end])
+	}
+
+	return ""
+}
+
+func tryActivateFromText(c tele.Context, botUsername string) (bool, error) {
+	if channelContextStore == nil || c.Sender() == nil || c.Message() == nil {
+		return false, nil
+	}
+
+	payload := extractPayloadFromText(c.Text(), botUsername)
+	if payload == "" {
+		return false, nil
+	}
+
+	channelID, err := ParseAndVerifyDeepLinkPayload(payload, deepLinkSecret, deepLinkMaxAge)
+	if err != nil {
+		return true, c.Send("Ссылка некорректна или устарела.")
+	}
+	if len(allowedChannelIDs) > 0 && !isAllowedChat(channelID, allowedChannelIDs) {
+		return true, c.Send("Этот канал не входит в TG_CHANNEL_LIST.")
+	}
+
+	contextKey, err := channelContextStore.ActivateChannelForUser(context.Background(), c.Sender().ID, channelID)
+	if err != nil {
+		log.Printf("Failed to activate channel context from text: %v", err)
+		return true, c.Send("Не удалось переключить канал. Попробуйте позже.")
+	}
+
+	log.Printf("Activated channel %d for user %d context=%s (from text)", channelID, c.Sender().ID, contextKey)
+	return true, c.Send(fmt.Sprintf("Канал переключен: %d", channelID))
+}
+
 func extractQuery(c tele.Context, botUsername string, requireMention bool) (string, bool) {
 	text := strings.TrimSpace(c.Text())
 	if text == "" {
@@ -1104,6 +1175,14 @@ func main() {
 		}
 
 		if !isSearchableUserMessage(c.Message()) {
+			return nil
+		}
+
+		activated, err := tryActivateFromText(c, b.Me.Username)
+		if err != nil {
+			return err
+		}
+		if activated {
 			return nil
 		}
 
