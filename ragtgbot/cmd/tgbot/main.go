@@ -22,8 +22,11 @@ const (
 	defaultEmbeddingServiceAddress = "http://localhost:8000/embeddings"
 	defaultQdrantServiceAddress    = "http://localhost:6333"
 	collectionName                 = "chat_history"
-	defaultVectorSearchLimit       = 3
-	defaultSearchMinScore          = 0.55
+	searchCandidateLimit           = 20
+	defaultVectorSearchLimit       = 1
+	defaultSearchMinScore          = 0.6
+	defaultSearchScoreGap          = 0.05
+	shortQueryRunes                = 6
 	restrictedAccessMessage        = "Этот бот работает только в разрешённых чатах. Вы можете развернуть свою копию: https://github.com/korjavin/ragtgbot"
 )
 
@@ -35,6 +38,7 @@ var (
 	vectorSearchLimit       int
 	requireBotMention       bool
 	searchMinScore          float64
+	searchScoreGap          float64
 )
 
 type TextList struct {
@@ -447,6 +451,114 @@ func resultScore(result map[string]interface{}) (float64, bool) {
 	return payloadFloat(result, "score")
 }
 
+func payloadText(payload map[string]interface{}) string {
+	text, _ := payload["text"].(string)
+	return text
+}
+
+func normalizeQuery(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+func textContainsQuery(text, query string) bool {
+	query = normalizeQuery(query)
+	if query == "" {
+		return false
+	}
+	return strings.Contains(normalizeQuery(text), query)
+}
+
+type rankedResult struct {
+	result map[string]interface{}
+	score  float64
+	text   string
+}
+
+func filterSearchResults(results []map[string]interface{}, query string, limit int, minScore, scoreGap float64) []map[string]interface{} {
+	query = normalizeQuery(query)
+	queryRunes := len([]rune(query))
+	shortQuery := queryRunes < shortQueryRunes
+
+	var items []rankedResult
+	for _, result := range results {
+		score, ok := resultScore(result)
+		if !ok || score < minScore {
+			continue
+		}
+
+		payload, ok := result["payload"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		text := payloadText(payload)
+		if text == "" {
+			continue
+		}
+
+		items = append(items, rankedResult{
+			result: result,
+			score:  score,
+			text:   text,
+		})
+	}
+
+	if len(items) == 0 {
+		return nil
+	}
+
+	var keywordMatches []rankedResult
+	for _, item := range items {
+		if textContainsQuery(item.text, query) {
+			keywordMatches = append(keywordMatches, item)
+		}
+	}
+
+	var selected []rankedResult
+	switch {
+	case len(keywordMatches) > 0:
+		selected = keywordMatches
+	case shortQuery:
+		log.Printf("Short query %q has no text matches among %d vector hits", query, len(items))
+		return nil
+	default:
+		selected = items
+	}
+
+	bestScore := selected[0].score
+	var filtered []rankedResult
+	for _, item := range selected {
+		if item.score+scoreGap < bestScore {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+
+	if shortQuery {
+		if len(filtered) > 1 {
+			filtered = filtered[:1]
+		}
+	} else if len(filtered) > limit {
+		filtered = filtered[:limit]
+	}
+
+	output := make([]map[string]interface{}, len(filtered))
+	for i, item := range filtered {
+		log.Printf("Selected result score=%.3f text=%q", item.score, truncateForLog(item.text, 80))
+		output[i] = item.result
+	}
+
+	return output
+}
+
+func truncateForLog(text string, max int) string {
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	return string(runes[:max]) + "..."
+}
+
 func isSearchableUserMessage(msg *tele.Message) bool {
 	if msg == nil {
 		return false
@@ -489,21 +601,21 @@ func handleSearchQuery(c tele.Context, query string) error {
 		return c.Send("Ошибка обработки запроса.")
 	}
 
-	results, err := searchQdrant(embedding, vectorSearchLimit, searchMinScore, allowedChannelIDs)
+	results, err := searchQdrant(embedding, searchCandidateLimit, searchMinScore, allowedChannelIDs)
 	if err != nil {
 		log.Printf("Search error: %v", err)
 		return c.Send("Ошибка поиска.")
+	}
+
+	results = filterSearchResults(results, query, vectorSearchLimit, searchMinScore, searchScoreGap)
+	if len(results) == 0 {
+		return c.Send("Подходящих постов не найдено.")
 	}
 
 	forwarded := 0
 	seen := make(map[string]struct{})
 
 	for _, result := range results {
-		score, ok := resultScore(result)
-		if ok {
-			log.Printf("Search hit score=%.3f", score)
-		}
-
 		payload, ok := result["payload"].(map[string]interface{})
 		if !ok {
 			continue
@@ -574,6 +686,13 @@ func main() {
 		}
 	}
 
+	searchScoreGap = defaultSearchScoreGap
+	if gapStr := os.Getenv("SEARCH_SCORE_GAP"); gapStr != "" {
+		if gap, err := strconv.ParseFloat(gapStr, 64); err == nil && gap >= 0 && gap <= 1 {
+			searchScoreGap = gap
+		}
+	}
+
 	allowedQueryChats = parseInt64List(os.Getenv("TG_GROUP_LIST"))
 	allowedChannelIDs = parseInt64List(os.Getenv("TG_CHANNEL_LIST"))
 	requireBotMention = parseBoolEnv(os.Getenv("REQUIRE_BOT_MENTION"), false)
@@ -595,7 +714,7 @@ func main() {
 	} else {
 		log.Println("Indexing enabled for all channels where bot is admin")
 	}
-	log.Printf("Search config: limit=%d min_score=%.2f", vectorSearchLimit, searchMinScore)
+	log.Printf("Search config: limit=%d min_score=%.2f score_gap=%.2f", vectorSearchLimit, searchMinScore, searchScoreGap)
 
 	if err := createQdrantCollection(collectionName); err != nil {
 		log.Fatalf("Failed to create/check Qdrant collection: %v", err)
