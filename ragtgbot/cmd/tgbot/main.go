@@ -87,13 +87,13 @@ func getEmbeddings(texts []string) ([]float32, error) {
 	return embeddingList[0], nil
 }
 
-func makePointID(chatID int64, messageID int) int64 {
+func makePointID(chatID int64, messageID int) uint64 {
 	h := fnv.New64a()
 	_, _ = fmt.Fprintf(h, "%d:%d", chatID, messageID)
-	return int64(h.Sum64())
+	return h.Sum64()
 }
 
-func saveToQdrant(pointID int64, chatID int64, messageID int, text string, embedding []float32) error {
+func saveToQdrant(pointID uint64, chatID int64, messageID int, text string, embedding []float32) error {
 	qdrantURL := fmt.Sprintf("%s/collections/%s/points", qdrantServiceAddress, collectionName)
 
 	embeddingInterface := make([]interface{}, len(embedding))

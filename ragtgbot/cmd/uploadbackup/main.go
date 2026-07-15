@@ -82,10 +82,10 @@ func main() {
 	fmt.Printf("Finished. Indexed %d messages, skipped %d.\n", indexed, skipped)
 }
 
-func makePointID(chatID int64, messageID int64) int64 {
+func makePointID(chatID int64, messageID int64) uint64 {
 	h := fnv.New64a()
 	_, _ = fmt.Fprintf(h, "%d:%d", chatID, messageID)
-	return int64(h.Sum64())
+	return h.Sum64()
 }
 
 func indexMessage(chatID int64, messageID int64, text string) error {
@@ -138,7 +138,7 @@ func getEmbedding(text string) ([]float64, error) {
 	return embeddingList[0], nil
 }
 
-func saveToQdrant(pointID int64, chatID int64, messageID int, text string, embedding []float64) error {
+func saveToQdrant(pointID uint64, chatID int64, messageID int, text string, embedding []float64) error {
 	qdrantURL := fmt.Sprintf("%s/collections/chat_history/points", qdrantBaseURL)
 
 	point := map[string]interface{}{
