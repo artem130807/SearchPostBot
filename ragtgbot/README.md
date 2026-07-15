@@ -16,6 +16,7 @@ OpenAI не используется.
 |--------|------------|
 | `cmd/tgbot` | Telegram-бот: индексация канала + поиск + forward |
 | `embedding_service` | Векторные embeddings (multilingual) |
+| `redis` | Контекст пользователя (`user_id -> active channel`) |
 | `cmd/uploadbackup` | Импорт истории канала из JSON-экспорта Telegram Desktop |
 
 ## Переменные окружения
@@ -26,9 +27,12 @@ OpenAI не используется.
 **Опциональные:**
 - `TG_CHANNEL_LIST` — ID каналов для индексации через запятую (если пусто — все каналы, где бот админ)
 - `TG_GROUP_LIST` — ID чатов, где принимаются запросы (если пусто — везде)
-- `VECTOR_SEARCH_LIMIT` — сколько постов пересылать (по умолчанию 5)
+- `VECTOR_SEARCH_LIMIT` — сколько постов пересылать (по умолчанию 3)
 - `EMBEDDING_SERVICE_ADDRESS` — URL сервиса embeddings
 - `QDRANT_SERVICE_ADDRESS` — URL Qdrant
+- `DEEP_LINK_SECRET` — общий секрет для подписанных deep-link payload
+- `REDIS_ADDRESS` / `REDIS_DB` / `REDIS_PASSWORD` — подключение к Redis
+- `BOT_OWNER_IDS` — список Telegram user ID владельцев (через запятую), кто может вызывать `/link` (default: `1781506158`)
 
 ## Запуск
 
@@ -43,7 +47,12 @@ docker-compose up -d
 1. Создайте бота через [@BotFather](https://t.me/BotFather).
 2. Добавьте бота **администратором** в канал (нужно право публикации/чтения постов).
 3. Узнайте ID канала (например, через [@userinfobot](https://t.me/userinfobot) или логи бота) и укажите в `TG_CHANNEL_LIST`.
-4. Напишите боту в личку или упомяните в группе: `@your_bot текст запроса`.
+4. Owner генерирует deep-link: `/link -1001234567890` (в личке с ботом).
+5. Разместите ссылку в нужном канале.
+6. Пользователь открывает бота по ссылке, после чего его запросы идут строго по этому каналу.
+
+Пример deep-link:
+`https://t.me/<bot_username>?start=v1.<channel_id>.<ts>.<signature>`
 
 ## Импорт истории канала
 

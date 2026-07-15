@@ -1,5 +1,12 @@
 version: "3.9"
 services:
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
   qdrant:
     image: qdrant/qdrant:latest
     ports:
@@ -14,12 +21,14 @@ services:
       - "8000:8000"
     restart: always
     depends_on:
+      - redis
       - qdrant
 
   tgbot:
     image: ghcr.io/korjavin/ragtgbot-tgbot
     restart: always
     depends_on:
+      - redis
       - qdrant
       - embedding_service
     environment:
@@ -32,6 +41,15 @@ services:
       - SEARCH_MIN_SCORE=${SEARCH_MIN_SCORE:-0.40}
       - SEARCH_SCORE_GAP=${SEARCH_SCORE_GAP:-0.04}
       - REQUIRE_BOT_MENTION=${REQUIRE_BOT_MENTION:-false}
+      - REDIS_ENABLED=${REDIS_ENABLED:-true}
+      - REDIS_ADDRESS=${REDIS_ADDRESS:-redis:6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_CONTEXT_TTL_HOURS=${REDIS_CONTEXT_TTL_HOURS:-720}
+      - DEEP_LINK_SECRET=${DEEP_LINK_SECRET}
+      - DEEP_LINK_MAX_AGE_HOURS=${DEEP_LINK_MAX_AGE_HOURS:-720}
+      - BOT_OWNER_IDS=${BOT_OWNER_IDS:-1781506158}
 
 volumes:
   qdrant_data:
+  redis_data:

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unicode"
 
 	tele "gopkg.in/telebot.v3"
@@ -22,12 +23,15 @@ import (
 const (
 	defaultEmbeddingServiceAddress = "http://localhost:8000/embeddings"
 	defaultQdrantServiceAddress    = "http://localhost:6333"
+	defaultRedisAddress            = "redis:6379"
 	collectionName                 = "chat_history"
 	searchCandidateLimit           = 20
 	defaultVectorSearchLimit       = 3
 	defaultSearchMinScore          = 0.40
 	defaultSearchScoreGap          = 0.04
 	minLetterTokenRunes            = 3
+	defaultOwnerUserIDs            = "1781506158"
+	deepLinkHelpMessage            = "Откройте бота по ссылке из нужного канала, чтобы привязать канал к диалогу."
 	restrictedAccessMessage        = "Этот бот работает только в разрешённых чатах. Вы можете развернуть свою копию: https://github.com/korjavin/ragtgbot"
 )
 
@@ -40,6 +44,10 @@ var (
 	requireBotMention       bool
 	searchMinScore          float64
 	searchScoreGap          float64
+	ownerUserIDs            []int64
+	channelContextStore     *ChannelContextStore
+	deepLinkSecret          string
+	deepLinkMaxAge          time.Duration
 )
 
 type TextList struct {
@@ -149,9 +157,9 @@ func searchQdrant(embedding []float32, limit int, minScore float64, channelIDs [
 			"name":   "data",
 			"vector": embeddingInterface,
 		},
-		"limit":          limit,
+		"limit":           limit,
 		"score_threshold": minScore,
-		"with_payload":   true,
+		"with_payload":    true,
 	}
 
 	if len(channelIDs) > 0 {
@@ -349,6 +357,28 @@ func parseInt64List(envValue string) []int64 {
 	return result
 }
 
+func parseOwnerIDs() []int64 {
+	raw := strings.TrimSpace(os.Getenv("BOT_OWNER_IDS"))
+	if raw == "" {
+		raw = defaultOwnerUserIDs
+	}
+	ids := parseInt64List(raw)
+	if len(ids) == 0 {
+		log.Println("Warning: BOT_OWNER_IDS is empty, fallback to default owner")
+		ids = parseInt64List(defaultOwnerUserIDs)
+	}
+	return ids
+}
+
+func isOwnerUser(userID int64) bool {
+	for _, ownerID := range ownerUserIDs {
+		if ownerID == userID {
+			return true
+		}
+	}
+	return false
+}
+
 func messageText(msg *tele.Message) string {
 	if msg == nil {
 		return ""
@@ -371,6 +401,142 @@ func parseBoolEnv(value string, defaultValue bool) bool {
 	default:
 		return defaultValue
 	}
+}
+
+func parseDurationHoursEnv(name string, defaultHours int) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return time.Duration(defaultHours) * time.Hour
+	}
+	hours, err := strconv.Atoi(raw)
+	if err != nil || hours <= 0 {
+		log.Printf("Warning: invalid %s=%q, using default %dh", name, raw, defaultHours)
+		return time.Duration(defaultHours) * time.Hour
+	}
+	return time.Duration(hours) * time.Hour
+}
+
+func initChannelContextStore() error {
+	redisEnabled := parseBoolEnv(os.Getenv("REDIS_ENABLED"), true)
+	if !redisEnabled {
+		log.Println("Redis context store is disabled by REDIS_ENABLED=false")
+		return nil
+	}
+
+	redisAddress := strings.TrimSpace(os.Getenv("REDIS_ADDRESS"))
+	if redisAddress == "" {
+		redisAddress = defaultRedisAddress
+	}
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+	redisDB := 0
+	if dbRaw := strings.TrimSpace(os.Getenv("REDIS_DB")); dbRaw != "" {
+		parsed, err := strconv.Atoi(dbRaw)
+		if err != nil {
+			return fmt.Errorf("invalid REDIS_DB: %w", err)
+		}
+		redisDB = parsed
+	}
+	contextTTL := parseDurationHoursEnv("REDIS_CONTEXT_TTL_HOURS", defaultDeepLinkTTLHours)
+	deepLinkMaxAge = parseDurationHoursEnv("DEEP_LINK_MAX_AGE_HOURS", defaultDeepLinkTTLHours)
+
+	deepLinkSecret = strings.TrimSpace(os.Getenv("DEEP_LINK_SECRET"))
+	if deepLinkSecret == "" {
+		return fmt.Errorf("DEEP_LINK_SECRET is required when Redis context store is enabled")
+	}
+
+	store := NewChannelContextStore(redisAddress, redisPassword, redisDB, contextTTL)
+	if err := store.Ping(context.Background()); err != nil {
+		return fmt.Errorf("redis ping failed: %w", err)
+	}
+	channelContextStore = store
+	log.Printf("Redis context store enabled at %s (db=%d, ttl=%s)", redisAddress, redisDB, contextTTL)
+	return nil
+}
+
+func resolveSearchChannels(c tele.Context) ([]int64, error) {
+	if channelContextStore == nil {
+		return allowedChannelIDs, nil
+	}
+	if c.Sender() == nil {
+		return nil, fmt.Errorf("unknown sender")
+	}
+	channelID, found, err := channelContextStore.GetActiveChannelForUser(context.Background(), c.Sender().ID)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		if len(allowedChannelIDs) > 0 {
+			return allowedChannelIDs, nil
+		}
+		return nil, nil
+	}
+	return []int64{channelID}, nil
+}
+
+func handleStart(c tele.Context) error {
+	if c.Sender() == nil {
+		return c.Send("Не удалось определить пользователя.")
+	}
+
+	args := c.Args()
+	if len(args) > 0 && channelContextStore != nil {
+		channelID, err := ParseAndVerifyDeepLinkPayload(args[0], deepLinkSecret, deepLinkMaxAge)
+		if err != nil {
+			log.Printf("Invalid /start payload from user %d: %v", c.Sender().ID, err)
+			return c.Send("Ссылка устарела или некорректна. Получите новую ссылку в нужном канале.")
+		}
+		if len(allowedChannelIDs) > 0 && !isAllowedChat(channelID, allowedChannelIDs) {
+			return c.Send("Этот канал не разрешён для поиска.")
+		}
+		contextKey, err := channelContextStore.ActivateChannelForUser(context.Background(), c.Sender().ID, channelID)
+		if err != nil {
+			log.Printf("Failed to activate channel context: %v", err)
+			return c.Send("Не удалось сохранить контекст канала. Попробуйте позже.")
+		}
+		log.Printf("Activated channel %d for user %d context=%s", channelID, c.Sender().ID, contextKey)
+		return c.Send(fmt.Sprintf("Канал привязан: %d. Теперь запросы будут идти только по нему.", channelID))
+	}
+
+	msg := "Отправьте текстовый запрос — я найду и перешлю подходящие посты из выбранного канала."
+	if channelContextStore != nil {
+		msg += "\n\nДля выбора канала перейдите по deep-link из канала."
+	} else {
+		msg += "\n\n" + deepLinkHelpMessage
+	}
+	if requireBotMention {
+		msg += "\nВ группах упоминайте бота: @" + c.Bot().Me.Username + " ваш запрос"
+	}
+	return c.Send(msg)
+}
+
+func handleLinkCommand(c tele.Context, botUsername string) error {
+	if c.Sender() == nil {
+		return c.Send("Не удалось определить пользователя.")
+	}
+	if !isOwnerUser(c.Sender().ID) {
+		return c.Send("Команда /link доступна только owner.")
+	}
+
+	if deepLinkSecret == "" {
+		return c.Send("Deep-link отключён: отсутствует DEEP_LINK_SECRET.")
+	}
+
+	args := c.Args()
+	if len(args) != 1 {
+		return c.Send("Использование: /link <channel_id>. Пример: /link -1001234567890")
+	}
+
+	channelID, err := strconv.ParseInt(strings.TrimSpace(args[0]), 10, 64)
+	if err != nil {
+		return c.Send("Некорректный channel_id. Ожидается число вида -1001234567890.")
+	}
+	if len(allowedChannelIDs) > 0 && !isAllowedChat(channelID, allowedChannelIDs) {
+		return c.Send("Этот канал не входит в TG_CHANNEL_LIST.")
+	}
+
+	payload := BuildDeepLinkPayload(channelID, time.Now(), deepLinkSecret)
+	link := fmt.Sprintf("https://t.me/%s?start=%s", botUsername, payload)
+	return c.Send("Ссылка для канала:\n" + link)
 }
 
 func extractQuery(c tele.Context, botUsername string, requireMention bool) (string, bool) {
@@ -712,7 +878,7 @@ func indexChannelPost(c tele.Context) error {
 	return saveToQdrant(pointID, chatID, msg.ID, text, embedding)
 }
 
-func handleSearchQuery(c tele.Context, query string) error {
+func handleSearchQuery(c tele.Context, query string, channelIDs []int64) error {
 	log.Printf("Search query: %q in chat %d", query, c.Chat().ID)
 
 	embedding, err := getEmbeddings([]string{query})
@@ -721,7 +887,7 @@ func handleSearchQuery(c tele.Context, query string) error {
 		return c.Send("Ошибка обработки запроса.")
 	}
 
-	results, err := searchQdrant(embedding, searchCandidateLimit, searchMinScore, allowedChannelIDs)
+	results, err := searchQdrant(embedding, searchCandidateLimit, searchMinScore, channelIDs)
 	if err != nil {
 		log.Printf("Search error: %v", err)
 		return c.Send("Ошибка поиска.")
@@ -815,7 +981,18 @@ func main() {
 
 	allowedQueryChats = parseInt64List(os.Getenv("TG_GROUP_LIST"))
 	allowedChannelIDs = parseInt64List(os.Getenv("TG_CHANNEL_LIST"))
+	ownerUserIDs = parseOwnerIDs()
 	requireBotMention = parseBoolEnv(os.Getenv("REQUIRE_BOT_MENTION"), false)
+	if err := initChannelContextStore(); err != nil {
+		log.Fatalf("Failed to initialize channel context store: %v", err)
+	}
+	if channelContextStore != nil {
+		defer func() {
+			if err := channelContextStore.Close(); err != nil {
+				log.Printf("Failed to close channel context store: %v", err)
+			}
+		}()
+	}
 
 	if len(allowedQueryChats) > 0 {
 		log.Printf("Queries allowed in %d chat(s)", len(allowedQueryChats))
@@ -835,6 +1012,7 @@ func main() {
 		log.Println("Indexing enabled for all channels where bot is admin")
 	}
 	log.Printf("Search config: limit=%d min_score=%.2f score_gap=%.2f", vectorSearchLimit, searchMinScore, searchScoreGap)
+	log.Printf("Owner users configured: %d", len(ownerUserIDs))
 
 	if err := createQdrantCollection(collectionName); err != nil {
 		log.Fatalf("Failed to create/check Qdrant collection: %v", err)
@@ -854,14 +1032,9 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	b.Handle("/start", func(c tele.Context) error {
-		msg := "Отправьте текстовый запрос — я найду и перешлю подходящие посты из проиндексированного канала."
-		if requireBotMention {
-			msg += "\n\nВ группах упоминайте бота: @" + b.Me.Username + " ваш запрос"
-		} else {
-			msg += "\n\nВ группах можно писать запрос без упоминания бота."
-		}
-		return c.Send(msg)
+	b.Handle("/start", handleStart)
+	b.Handle("/link", func(c tele.Context) error {
+		return handleLinkCommand(c, b.Me.Username)
 	})
 
 	b.Handle(tele.OnChannelPost, func(c tele.Context) error {
@@ -896,7 +1069,16 @@ func main() {
 			return c.Send(restrictedAccessMessage)
 		}
 
-		return handleSearchQuery(c, query)
+		searchChannelIDs, err := resolveSearchChannels(c)
+		if err != nil {
+			log.Printf("Failed to resolve channel context: %v", err)
+			return c.Send("Ошибка получения контекста канала. Попробуйте позже.")
+		}
+		if len(searchChannelIDs) == 0 {
+			return c.Send("Канал для поиска не выбран. " + deepLinkHelpMessage)
+		}
+
+		return handleSearchQuery(c, query, searchChannelIDs)
 	})
 
 	go b.Start()
