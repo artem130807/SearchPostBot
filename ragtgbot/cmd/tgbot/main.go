@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"unicode"
 
 	tele "gopkg.in/telebot.v3"
 )
@@ -23,10 +24,10 @@ const (
 	defaultQdrantServiceAddress    = "http://localhost:6333"
 	collectionName                 = "chat_history"
 	searchCandidateLimit           = 20
-	defaultVectorSearchLimit       = 1
-	defaultSearchMinScore          = 0.6
-	defaultSearchScoreGap          = 0.05
-	shortQueryRunes                = 6
+	defaultVectorSearchLimit       = 3
+	defaultSearchMinScore          = 0.40
+	defaultSearchScoreGap          = 0.04
+	minLetterTokenRunes            = 3
 	restrictedAccessMessage        = "Этот бот работает только в разрешённых чатах. Вы можете развернуть свою копию: https://github.com/korjavin/ragtgbot"
 )
 
@@ -460,24 +461,137 @@ func normalizeQuery(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
-func textContainsQuery(text, query string) bool {
-	query = normalizeQuery(query)
-	if query == "" {
+var queryStopWords = map[string]struct{}{
+	"и": {}, "в": {}, "во": {}, "на": {}, "с": {}, "со": {}, "по": {}, "к": {}, "ко": {},
+	"у": {}, "о": {}, "об": {}, "от": {}, "до": {}, "из": {}, "за": {}, "для": {}, "при": {},
+	"не": {}, "но": {}, "а": {}, "я": {}, "мы": {}, "вы": {}, "он": {}, "она": {}, "они": {},
+	"что": {}, "как": {}, "где": {}, "когда": {}, "кто": {}, "это": {}, "этот": {}, "эта": {}, "эти": {},
+	"ли": {}, "же": {}, "бы": {}, "был": {}, "была": {}, "были": {}, "есть": {},
+	"улица": {}, "улицу": {}, "улице": {}, "проспект": {}, "проспекте": {}, "проспекта": {},
+	"пер": {}, "переулок": {}, "переулке": {}, "дом": {}, "дома": {}, "корп": {}, "корпус": {},
+}
+
+func isStopWord(token string) bool {
+	_, ok := queryStopWords[token]
+	return ok
+}
+
+func isNumericToken(token string) bool {
+	for _, r := range token {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return len(token) > 0
+}
+
+func tokenizeSignificant(text string) []string {
+	normalized := normalizeQuery(text)
+	parts := strings.FieldsFunc(normalized, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
+
+	tokens := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || isStopWord(part) {
+			continue
+		}
+
+		runes := []rune(part)
+		if unicode.IsDigit(runes[0]) {
+			if len(runes) >= 1 {
+				if _, ok := seen[part]; !ok {
+					seen[part] = struct{}{}
+					tokens = append(tokens, part)
+				}
+			}
+			continue
+		}
+
+		if len(runes) < minLetterTokenRunes {
+			continue
+		}
+
+		if _, ok := seen[part]; !ok {
+			seen[part] = struct{}{}
+			tokens = append(tokens, part)
+		}
+	}
+
+	return tokens
+}
+
+func textHasToken(text, token string) bool {
+	text = normalizeQuery(text)
+	token = normalizeQuery(token)
+	if token == "" {
 		return false
 	}
-	return strings.Contains(normalizeQuery(text), query)
+
+	if isNumericToken(token) {
+		return strings.Contains(text, token)
+	}
+
+	if len([]rune(token)) < minLetterTokenRunes {
+		return false
+	}
+
+	return strings.Contains(text, token)
+}
+
+func countMatchedTokens(text string, tokens []string) int {
+	matched := 0
+	for _, token := range tokens {
+		if textHasToken(text, token) {
+			matched++
+		}
+	}
+	return matched
 }
 
 type rankedResult struct {
-	result map[string]interface{}
-	score  float64
-	text   string
+	result        map[string]interface{}
+	score         float64
+	text          string
+	matchedTokens int
+	totalTokens   int
+	tokenRatio    float64
+	combinedScore float64
+}
+
+func acceptsCandidate(item rankedResult, queryTokens []string) bool {
+	if item.totalTokens == 0 {
+		return item.score >= 0.65
+	}
+
+	if item.matchedTokens == 0 {
+		return item.score >= 0.72
+	}
+
+	if len(queryTokens) == 1 {
+		return item.matchedTokens == 1 && item.score >= 0.42
+	}
+
+	if item.tokenRatio >= 0.5 && item.score >= 0.42 {
+		return true
+	}
+
+	if item.matchedTokens >= 2 && item.score >= 0.40 {
+		return true
+	}
+
+	if item.matchedTokens >= 1 && item.score >= 0.58 {
+		return true
+	}
+
+	return item.score >= 0.68 && item.matchedTokens >= 1
 }
 
 func filterSearchResults(results []map[string]interface{}, query string, limit int, minScore, scoreGap float64) []map[string]interface{} {
-	query = normalizeQuery(query)
-	queryRunes := len([]rune(query))
-	shortQuery := queryRunes < shortQueryRunes
+	queryTokens := tokenizeSignificant(query)
+	log.Printf("Query tokens: %v", queryTokens)
 
 	var items []rankedResult
 	for _, result := range results {
@@ -496,55 +610,61 @@ func filterSearchResults(results []map[string]interface{}, query string, limit i
 			continue
 		}
 
-		items = append(items, rankedResult{
-			result: result,
-			score:  score,
-			text:   text,
-		})
+		matched := countMatchedTokens(text, queryTokens)
+		total := len(queryTokens)
+		ratio := 0.0
+		if total > 0 {
+			ratio = float64(matched) / float64(total)
+		}
+
+		item := rankedResult{
+			result:        result,
+			score:         score,
+			text:          text,
+			matchedTokens: matched,
+			totalTokens:   total,
+			tokenRatio:    ratio,
+			combinedScore: score*0.55 + ratio*0.45,
+		}
+
+		if !acceptsCandidate(item, queryTokens) {
+			continue
+		}
+
+		items = append(items, item)
 	}
 
 	if len(items) == 0 {
 		return nil
 	}
 
-	var keywordMatches []rankedResult
-	for _, item := range items {
-		if textContainsQuery(item.text, query) {
-			keywordMatches = append(keywordMatches, item)
+	// Sort by combined score descending (simple bubble for small N).
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			if items[j].combinedScore > items[i].combinedScore {
+				items[i], items[j] = items[j], items[i]
+			}
 		}
 	}
 
-	var selected []rankedResult
-	switch {
-	case len(keywordMatches) > 0:
-		selected = keywordMatches
-	case shortQuery:
-		log.Printf("Short query %q has no text matches among %d vector hits", query, len(items))
-		return nil
-	default:
-		selected = items
-	}
-
-	bestScore := selected[0].score
-	var filtered []rankedResult
-	for _, item := range selected {
-		if item.score+scoreGap < bestScore {
+	bestCombined := items[0].combinedScore
+	filtered := make([]rankedResult, 0, limit)
+	for _, item := range items {
+		if bestCombined-item.combinedScore > scoreGap {
 			continue
 		}
 		filtered = append(filtered, item)
-	}
-
-	if shortQuery {
-		if len(filtered) > 1 {
-			filtered = filtered[:1]
+		if len(filtered) >= limit {
+			break
 		}
-	} else if len(filtered) > limit {
-		filtered = filtered[:limit]
 	}
 
 	output := make([]map[string]interface{}, len(filtered))
 	for i, item := range filtered {
-		log.Printf("Selected result score=%.3f text=%q", item.score, truncateForLog(item.text, 80))
+		log.Printf(
+			"Selected result vector=%.3f tokens=%d/%d combined=%.3f text=%q",
+			item.score, item.matchedTokens, item.totalTokens, item.combinedScore, truncateForLog(item.text, 80),
+		)
 		output[i] = item.result
 	}
 
