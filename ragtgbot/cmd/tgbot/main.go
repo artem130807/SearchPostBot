@@ -478,9 +478,9 @@ func handleStart(c tele.Context) error {
 		return c.Send("Не удалось определить пользователя.")
 	}
 
-	args := c.Args()
-	if len(args) > 0 && channelContextStore != nil {
-		channelID, err := ParseAndVerifyDeepLinkPayload(args[0], deepLinkSecret, deepLinkMaxAge)
+	payload := extractStartPayload(c)
+	if payload != "" && channelContextStore != nil {
+		channelID, err := ParseAndVerifyDeepLinkPayload(payload, deepLinkSecret, deepLinkMaxAge)
 		if err != nil {
 			log.Printf("Invalid /start payload from user %d: %v", c.Sender().ID, err)
 			return c.Send("Ссылка устарела или некорректна. Получите новую ссылку в нужном канале.")
@@ -507,6 +507,52 @@ func handleStart(c tele.Context) error {
 		msg += "\nВ группах упоминайте бота: @" + c.Bot().Me.Username + " ваш запрос"
 	}
 	return c.Send(msg)
+}
+
+func extractStartPayload(c tele.Context) string {
+	if msg := c.Message(); msg != nil {
+		if payload := strings.TrimSpace(msg.Payload); payload != "" {
+			return payload
+		}
+	}
+
+	args := c.Args()
+	if len(args) > 0 {
+		return strings.TrimSpace(args[0])
+	}
+
+	text := strings.TrimSpace(c.Text())
+	if text == "" {
+		return ""
+	}
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		return ""
+	}
+	command := parts[0]
+	if strings.HasPrefix(command, "/start") {
+		return strings.TrimSpace(parts[1])
+	}
+	return ""
+}
+
+func handleChannelCommand(c tele.Context) error {
+	if c.Sender() == nil {
+		return c.Send("Не удалось определить пользователя.")
+	}
+	if channelContextStore == nil {
+		return c.Send("Контекст канала отключён (Redis).")
+	}
+
+	channelID, found, err := channelContextStore.GetActiveChannelForUser(context.Background(), c.Sender().ID)
+	if err != nil {
+		log.Printf("Failed to read active channel for user %d: %v", c.Sender().ID, err)
+		return c.Send("Ошибка чтения текущей привязки.")
+	}
+	if !found {
+		return c.Send("Канал не привязан. Откройте бота по deep-link из нужного канала.")
+	}
+	return c.Send(fmt.Sprintf("Текущая привязка: %d", channelID))
 }
 
 func handleLinkCommand(c tele.Context, botUsername string) error {
@@ -1036,6 +1082,7 @@ func main() {
 	b.Handle("/link", func(c tele.Context) error {
 		return handleLinkCommand(c, b.Me.Username)
 	})
+	b.Handle("/channel", handleChannelCommand)
 
 	b.Handle(tele.OnChannelPost, func(c tele.Context) error {
 		if err := indexChannelPost(c); err != nil {
