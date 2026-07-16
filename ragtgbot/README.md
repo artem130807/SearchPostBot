@@ -22,7 +22,7 @@ OpenAI не используется.
 ## Переменные окружения
 
 **Обязательные:**
-- `TELEGRAM_BOT_TOKEN` — токен от BotFather
+- `TELEGRAM_BOT_TOKEN_1..5` — токены 5 ботов от BotFather (для `docker-compose`)
 
 **Опциональные:**
 - `TG_CHANNEL_LIST` — ID каналов для индексации через запятую (если пусто — все каналы, где бот админ)
@@ -32,6 +32,7 @@ OpenAI не используется.
 - `QDRANT_SERVICE_ADDRESS` — URL Qdrant
 - `DEEP_LINK_SECRET` — общий секрет для подписанных deep-link payload
 - `REDIS_ADDRESS` / `REDIS_DB` / `REDIS_PASSWORD` — подключение к Redis
+- `REDIS_KEY_PREFIX_1..5` — namespace ключей Redis для каждого бота (чтобы контексты не пересекались)
 - `BOT_OWNER_IDS` — список Telegram user ID владельцев (через запятую), кто может вызывать `/link` (default: `1781506158`)
 
 ## Запуск
@@ -41,6 +42,8 @@ export TELEGRAM_BOT_TOKEN=your_token
 export TG_CHANNEL_LIST=-1001234567890
 docker-compose up -d
 ```
+
+Для запуска пяти ботов заполните `.env` токенами `TELEGRAM_BOT_TOKEN_1..5`.
 
 ## Настройка Telegram
 

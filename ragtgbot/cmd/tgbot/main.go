@@ -24,6 +24,7 @@ const (
 	defaultEmbeddingServiceAddress = "http://localhost:8000/embeddings"
 	defaultQdrantServiceAddress    = "http://localhost:6333"
 	defaultRedisAddress            = "redis:6379"
+	defaultRedisKeyPrefix          = "spb"
 	collectionName                 = "chat_history"
 	searchCandidateLimit           = 20
 	defaultVectorSearchLimit       = 3
@@ -46,6 +47,7 @@ var (
 	searchScoreGap          float64
 	ownerUserIDs            []int64
 	channelContextStore     *ChannelContextStore
+	redisKeyPrefix          string
 	deepLinkSecret          string
 	deepLinkMaxAge          time.Duration
 )
@@ -438,18 +440,22 @@ func initChannelContextStore() error {
 	}
 	contextTTL := parseDurationHoursEnv("REDIS_CONTEXT_TTL_HOURS", defaultDeepLinkTTLHours)
 	deepLinkMaxAge = parseDurationHoursEnv("DEEP_LINK_MAX_AGE_HOURS", defaultDeepLinkTTLHours)
+	redisKeyPrefix = strings.TrimSpace(os.Getenv("REDIS_KEY_PREFIX"))
+	if redisKeyPrefix == "" {
+		redisKeyPrefix = defaultRedisKeyPrefix
+	}
 
 	deepLinkSecret = strings.TrimSpace(os.Getenv("DEEP_LINK_SECRET"))
 	if deepLinkSecret == "" {
 		return fmt.Errorf("DEEP_LINK_SECRET is required when Redis context store is enabled")
 	}
 
-	store := NewChannelContextStore(redisAddress, redisPassword, redisDB, contextTTL)
+	store := NewChannelContextStore(redisAddress, redisPassword, redisDB, contextTTL, redisKeyPrefix)
 	if err := store.Ping(context.Background()); err != nil {
 		return fmt.Errorf("redis ping failed: %w", err)
 	}
 	channelContextStore = store
-	log.Printf("Redis context store enabled at %s (db=%d, ttl=%s)", redisAddress, redisDB, contextTTL)
+	log.Printf("Redis context store enabled at %s (db=%d, ttl=%s, key_prefix=%s)", redisAddress, redisDB, contextTTL, redisKeyPrefix)
 	return nil
 }
 
@@ -583,77 +589,6 @@ func handleLinkCommand(c tele.Context, botUsername string) error {
 	payload := BuildDeepLinkPayload(channelID, time.Now(), deepLinkSecret)
 	link := fmt.Sprintf("https://t.me/%s?start=%s", botUsername, payload)
 	return c.Send("Ссылка для канала:\n" + link)
-}
-
-func extractPayloadFromText(text, botUsername string) string {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return ""
-	}
-
-	// Allow raw payload to be sent directly.
-	if strings.HasPrefix(text, "v1.") {
-		return text
-	}
-
-	prefixes := []string{
-		"https://t.me/" + botUsername + "?start=",
-		"http://t.me/" + botUsername + "?start=",
-		"t.me/" + botUsername + "?start=",
-	}
-
-	lowerText := strings.ToLower(text)
-	for _, prefix := range prefixes {
-		lowerPrefix := strings.ToLower(prefix)
-		idx := strings.Index(lowerText, lowerPrefix)
-		if idx < 0 {
-			continue
-		}
-		start := idx + len(prefix)
-		rest := text[start:]
-		if rest == "" {
-			return ""
-		}
-		// Payload ends at first whitespace or URL delimiter.
-		end := len(rest)
-		for i, r := range rest {
-			if r == ' ' || r == '\n' || r == '\t' || r == '&' {
-				end = i
-				break
-			}
-		}
-		return strings.TrimSpace(rest[:end])
-	}
-
-	return ""
-}
-
-func tryActivateFromText(c tele.Context, botUsername string) (bool, error) {
-	if channelContextStore == nil || c.Sender() == nil || c.Message() == nil {
-		return false, nil
-	}
-
-	payload := extractPayloadFromText(c.Text(), botUsername)
-	if payload == "" {
-		return false, nil
-	}
-
-	channelID, err := ParseAndVerifyDeepLinkPayload(payload, deepLinkSecret, deepLinkMaxAge)
-	if err != nil {
-		return true, c.Send("Ссылка некорректна или устарела.")
-	}
-	if len(allowedChannelIDs) > 0 && !isAllowedChat(channelID, allowedChannelIDs) {
-		return true, c.Send("Этот канал не входит в TG_CHANNEL_LIST.")
-	}
-
-	contextKey, err := channelContextStore.ActivateChannelForUser(context.Background(), c.Sender().ID, channelID)
-	if err != nil {
-		log.Printf("Failed to activate channel context from text: %v", err)
-		return true, c.Send("Не удалось переключить канал. Попробуйте позже.")
-	}
-
-	log.Printf("Activated channel %d for user %d context=%s (from text)", channelID, c.Sender().ID, contextKey)
-	return true, c.Send(fmt.Sprintf("Канал переключен: %d", channelID))
 }
 
 func extractQuery(c tele.Context, botUsername string, requireMention bool) (string, bool) {
@@ -1175,14 +1110,6 @@ func main() {
 		}
 
 		if !isSearchableUserMessage(c.Message()) {
-			return nil
-		}
-
-		activated, err := tryActivateFromText(c, b.Me.Username)
-		if err != nil {
-			return err
-		}
-		if activated {
 			return nil
 		}
 

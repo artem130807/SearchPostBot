@@ -24,19 +24,25 @@ const (
 )
 
 type ChannelContextStore struct {
-	client *redis.Client
-	ttl    time.Duration
+	client    *redis.Client
+	ttl       time.Duration
+	keyPrefix string
 }
 
-func NewChannelContextStore(addr, password string, db int, ttl time.Duration) *ChannelContextStore {
+func NewChannelContextStore(addr, password string, db int, ttl time.Duration, keyPrefix string) *ChannelContextStore {
+	keyPrefix = strings.TrimSpace(keyPrefix)
+	if keyPrefix != "" && !strings.HasSuffix(keyPrefix, ":") {
+		keyPrefix += ":"
+	}
 	client := redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: password,
 		DB:       db,
 	})
 	return &ChannelContextStore{
-		client: client,
-		ttl:    ttl,
+		client:    client,
+		ttl:       ttl,
+		keyPrefix: keyPrefix,
 	}
 }
 
@@ -54,8 +60,8 @@ func (s *ChannelContextStore) ActivateChannelForUser(ctx context.Context, userID
 		return "", err
 	}
 
-	channelKey := channelContextRedisKey(key)
-	userActiveKey := userActiveContextRedisKey(userID)
+	channelKey := s.channelContextRedisKey(key)
+	userActiveKey := s.userActiveContextRedisKey(userID)
 	channelValue := strconv.FormatInt(channelID, 10)
 
 	pipe := s.client.TxPipeline()
@@ -69,7 +75,7 @@ func (s *ChannelContextStore) ActivateChannelForUser(ctx context.Context, userID
 }
 
 func (s *ChannelContextStore) GetActiveChannelForUser(ctx context.Context, userID int64) (int64, bool, error) {
-	userActiveKey := userActiveContextRedisKey(userID)
+	userActiveKey := s.userActiveContextRedisKey(userID)
 	ctxKey, err := s.client.Get(ctx, userActiveKey).Result()
 	if err == redis.Nil {
 		return 0, false, nil
@@ -78,7 +84,7 @@ func (s *ChannelContextStore) GetActiveChannelForUser(ctx context.Context, userI
 		return 0, false, err
 	}
 
-	channelKey := channelContextRedisKey(ctxKey)
+	channelKey := s.channelContextRedisKey(ctxKey)
 	channelRaw, err := s.client.Get(ctx, channelKey).Result()
 	if err == redis.Nil {
 		return 0, false, nil
@@ -153,4 +159,12 @@ func channelContextRedisKey(contextKey string) string {
 
 func userActiveContextRedisKey(userID int64) string {
 	return userContextKeyPrefix + strconv.FormatInt(userID, 10) + activeContextKeyPostfix
+}
+
+func (s *ChannelContextStore) channelContextRedisKey(contextKey string) string {
+	return s.keyPrefix + channelContextRedisKey(contextKey)
+}
+
+func (s *ChannelContextStore) userActiveContextRedisKey(userID int64) string {
+	return s.keyPrefix + userActiveContextRedisKey(userID)
 }
