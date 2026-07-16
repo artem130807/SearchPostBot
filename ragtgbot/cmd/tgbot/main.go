@@ -500,10 +500,9 @@ func handleStart(c tele.Context) error {
 			return c.Send("Не удалось сохранить контекст канала. Попробуйте позже.")
 		}
 		log.Printf("Activated channel %d for user %d context=%s", channelID, c.Sender().ID, contextKey)
-		return c.Send(fmt.Sprintf("Канал привязан: %d. Теперь запросы будут идти только по нему.", channelID))
 	}
 
-	msg := "Отправьте текстовый запрос — я найду и перешлю подходящие посты из выбранного канала."
+	msg := "Отправьте текстовый запрос — я найду и перешлю подходящие посты из канала."
 	if channelContextStore != nil {
 		msg += "\n\nДля выбора канала перейдите по deep-link из канала."
 	} else {
